@@ -1,0 +1,246 @@
+- name: Prepare all nodes for Kubernetes
+  hosts: k8s_cluster
+  become: yes 
+  tasks:
+    - name: 0-1. 確保系統已安裝 python3-pip
+      apt:
+        name: python3-pip
+        state: present
+        update_cache: yes
+
+    - name: 0-2. 安裝 Ansible K8s 模組必備的 python kubernetes 套件
+      pip:
+        name: kubernetes
+        state: present
+        executable: pip3
+        
+    - name: 1. Close Swap
+      command: swapoff -a 
+    - name: Close Swap permanently 
+      replace: 
+        path: /etc/fstab
+        regexp: '^([^#].*swap.*)$'
+        replace: '# \1'
+
+    - name: 2. Load linux kernel module
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "1"
+        state: present
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+    
+    - name: 3. Update apt package and install basic tools
+      apt:
+        update_cache: yes
+        name: 
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - nfs-common  
+        state: present
+    
+    - name: 4. Install containerd container runtime
+      apt: 
+        name: containerd
+        state: present
+    
+    - name: Config containerd default settings
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+      notify: Restart containerd
+
+    - name: 5. Add Kubernetes official keyrings
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | gpg --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+
+    - name: 6. Install K8s 3 main components (kubeadm, kubelet, kubectl)
+      apt: 
+        update_cache: yes
+        name: ['kubeadm', 'kubelet', 'kubectl']
+        state: present
+    
+    - name: Lock k8s package version avoid upgrade accidently
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: ['kubeadm', 'kubelet', 'kubectl']
+
+  handlers:
+    - name: Restart containerd 
+      systemd: 
+        name: containerd
+        state: restarted
+        enabled: yes
+
+- name: Initialize Kubernetes Master Node
+  hosts: masters
+  become: yes
+  tasks:
+    - name: 1. 執行 kubeadm init
+      shell: kubeadm init --pod-network-cidr=10.0.0.0/8
+      register: kubeadm_init_output
+      args:
+        creates: /etc/kubernetes/admin.conf  
+
+    - name: 2. 為 root 使用者配置 kubectl 權限
+      shell: |
+        mkdir -p $HOME/.kube
+        cp -f /etc/kubernetes/admin.conf $HOME/.kube/config
+        chown $(id -u):$(id -g) $HOME/.kube/config
+      failed_when: false
+
+    - name: 3-1. 獲取 Cilium CLI 最新版本號
+      uri:
+        url: https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt
+        return_content: yes
+      register: cilium_stable_version
+      changed_when: false
+
+    - name: 3-2. 下載並解壓 Cilium CLI 到 /usr/local/bin
+      ansible.builtin.unarchive:
+        src: "https://github.com/cilium/cilium-cli/releases/download/{{ cilium_stable_version.content | trim }}/cilium-linux-amd64.tar.gz"
+        dest: /usr/local/bin
+        remote_src: yes
+        mode: '0755'
+        creates: /usr/local/bin/cilium 
+
+    - name: 4-1. 檢查 Cilium 是否已經安裝在叢集中
+      shell: /usr/local/bin/cilium status --output json
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cilium_check
+      failed_when: false
+      changed_when: false 
+
+    - name: 4-2. 使用 Cilium CLI 部署 Cilium CNI 網路插件
+      shell: /usr/local/bin/cilium install
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: cilium_check.rc != 0
+
+    - name: 5. 啟用 Hubble 服務與網頁 UI，並自動配置為 NodePort
+      shell: |
+        /usr/local/bin/cilium hubble enable --ui
+        kubectl patch svc hubble-ui -n kube-system -p '{"spec": {"type": "NodePort"}}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 6. 動態生成 Worker 節點的 Join 指令並存成變數
+      shell: kubeadm token create --print-join-command
+      register: join_command_raw
+
+    - name: 7. 將 Join 指令共享給全域變數
+      add_host:
+        name: "K8S_JOIN_HOLDER"
+        join_cmd: "{{ join_command_raw.stdout }}"
+
+    - name: 8. 安裝 Helm 客戶端工具 
+      shell: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+
+    - name: 9-1. 配置 Metrics Server 官方 Helm 儲存庫
+      kubernetes.core.helm_repository:
+        name: metrics-server
+        repo_url: "https://kubernetes-sigs.github.io/metrics-server/"
+
+    - name: 9-2. 部署 Metrics Server
+      kubernetes.core.helm:
+        name: metrics-server
+        chart_ref: metrics-server/metrics-server
+        release_namespace: kube-system
+        state: present
+        values:
+          args:
+            - --kubelet-insecure-tls
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 10. 新增 Headlamp 官方最新 Helm 儲存庫 
+      shell: |
+        /usr/local/bin/helm repo add headlamp https://kubernetes-sigs.github.io/headlamp/
+        /usr/local/bin/helm repo update
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 11. 使用 Helm 原生部署 Headlamp 至 kube-system 空間
+      kubernetes.core.helm:
+        name: headlamp
+        chart_ref: headlamp/headlamp
+        release_namespace: kube-system
+        state: present
+        values:
+          service:
+            type: NodePort
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 12. 建立官方管理員帳號與永久 Secret 綁定
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: headlamp-admin
+          namespace: kube-system
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: headlamp-admin
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: cluster-admin
+        subjects:
+        - kind: ServiceAccount
+          name: headlamp-admin
+          namespace: kube-system
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: headlamp-admin-secret
+          namespace: kube-system
+          annotations:
+            kubernetes.io/service-account-token: "true"
+            kubernetes.io/service-account.name: "headlamp-admin"
+        type: kubernetes.io/service-account-token
+        EOF
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 13. 撈取官方標準的永久管理員登入 Token
+      shell: |
+        kubectl get secret headlamp-admin-secret -n kube-system -o jsonpath='{.data.token}' | base64 --decode
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: headlamp_stable_token
+    
+
+    - name:  【Headlamp 登入資訊】
+      ansible.builtin.debug:
+        msg: 
+          - "=========================================================="
+          - " Headlamp 控制台部署成功！"
+          - " 登入所需的「永久」Token 如下："
+          - " {{ headlamp_stable_token.stdout }}"
+          - "=========================================================="
+
+- name: Join Worker Nodes to Cluster
+  hosts: workers
+  become: yes
+  tasks:
+    - name: 1. 執行 Join 指令加入 Master
+      shell: "{{ hostvars['K8S_JOIN_HOLDER']['join_cmd'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf  

@@ -1,0 +1,115 @@
+---
+- name: Deploy Loki Log Engine with NFS
+  hosts: masters
+  become: yes
+  run_once: true
+  tasks:
+    - name: 1-1. 配置 Grafana 官方 Helm 儲存庫
+      kubernetes.core.helm_repository:
+        name: grafana
+        repo_url: "https://grafana.github.io/helm-charts"
+
+    - name: 2-1. 使用 Helm 部署 Loki 至 logging 空間
+      kubernetes.core.helm:
+        name: loki
+        chart_ref: grafana/loki
+        release_namespace: logging
+        state: present
+        values:
+          deploymentMode: SingleBinary
+
+          read:
+            replicas: 0
+          write:
+            replicas: 0
+          backend:
+            replicas: 0
+
+          ingester:
+            replicas: 0
+          querier:
+            replicas: 0
+          queryFrontend:
+            replicas: 0
+          queryScheduler:
+            replicas: 0
+          distributor:
+            replicas: 0
+          compactor:
+            replicas: 0
+          indexGateway:
+            replicas: 0
+
+          chunksCache:
+            enabled: false
+          resultsCache:
+            enabled: false #
+          singleBinary:
+            replicas: 1
+            persistence:
+              enabled: true
+              storageClass: nfs-client
+              size: 20Gi
+              accessModes:
+                - ReadWriteOnce
+
+          # 6. 基本儲存與安全性配置
+          loki:
+            auth_enabled: false
+            storage:
+
+            commonConfig:
+              replication_factor: 1
+
+            ingester:
+              lifecycler:
+                ring:
+                  kvstore:
+                    store: inmemory
+
+            memberlist:
+              enabled: false
+
+            schemaConfig:
+              configs:
+                - from: "2024-01-01"
+                  store: tsdb
+                  object_store: filesystem
+                  schema: v13
+                  index:
+                    prefix: index_
+                    period: 24h
+
+          # 7. 關閉不需要的進階組件
+          gateway:
+            enabled: false
+          monitoring:
+            dashboards:
+              enabled: false
+            rules:
+              enabled: false
+            alerts:
+              enabled: false
+            serviceMonitor:
+              enabled: false
+            selfMonitoring:
+              grafanaAgent:
+                install: false
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 3-1. 檢查 Loki 的 PVC 狀態
+      shell: |
+        kubectl get pvc -n logging | grep loki
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: loki_pvc_status
+      changed_when: false
+
+    - name: 【輸出 Loki 部署狀態與連線網址】
+      ansible.builtin.debug:
+        msg:
+          - "=========================================================="
+          - " K8s 叢集內部連線網址 (Data Source URL):"
+          - "    http://loki-headless.logging.svc.cluster.local:3100"
+          - "=========================================================="

@@ -1,0 +1,138 @@
+---
+- name: Deploy NFS Dynamic Provisioner
+  hosts: masters
+  become: yes
+  run_once: true
+  vars:
+    NFS_SERVER_IP: "{{ groups['nfs_server'][0] }}"
+    NFS_SHARE_PATH: "/data/nfs/shared"
+  tasks:
+    - name: 1. 部署 NFS 儲存驅動系統 (使用原生 K8s 模組)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          - apiVersion: v1
+            kind: Namespace
+            metadata:
+              name: nfs-storage
+          - apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: nfs-client-provisioner
+              namespace: nfs-storage
+
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRole
+            metadata:
+              name: nfs-client-provisioner-runner
+            rules:
+              - apiGroups: [""]
+                resources: ["persistentvolumes"]
+                verbs: ["get", "list", "watch", "create", "delete"]
+              - apiGroups: [""]
+                resources: ["persistentvolumeclaims"]
+                verbs: ["get", "list", "watch", "update"]
+              - apiGroups: ["storage.k8s.io"]
+                resources: ["storageclasses"]
+                verbs: ["get", "list", "watch"]
+              - apiGroups: [""]
+                resources: ["events"]
+                verbs: ["create", "update", "patch"]
+
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRoleBinding
+            metadata:
+              name: run-nfs-client-provisioner
+            subjects:
+              - kind: ServiceAccount
+                name: nfs-client-provisioner
+                namespace: nfs-storage
+            roleRef:
+              kind: ClusterRole
+              name: nfs-client-provisioner-runner
+              apiGroup: rbac.authorization.k8s.io
+
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: Role
+            metadata:
+              name: leader-locking-nfs-client-provisioner
+              namespace: nfs-storage
+            rules:
+              - apiGroups: [""]
+                resources: ["endpoints"]
+                verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: RoleBinding
+            metadata:
+              name: leader-locking-nfs-client-provisioner
+              namespace: nfs-storage
+            subjects:
+              - kind: ServiceAccount
+                name: nfs-client-provisioner
+                namespace: nfs-storage
+            roleRef:
+              kind: Role
+              name: leader-locking-nfs-client-provisioner
+              apiGroup: rbac.authorization.k8s.io
+
+          - apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: nfs-client-provisioner
+              namespace: nfs-storage
+              labels:
+                app: nfs-client-provisioner
+            spec:
+              replicas: 1
+              strategy:
+                type: Recreate
+              selector:
+                matchLabels:
+                  app: nfs-client-provisioner
+              template:
+                metadata:
+                  labels:
+                    app: nfs-client-provisioner
+                spec:
+                  serviceAccountName: nfs-client-provisioner
+                  containers:
+                    - name: nfs-client-provisioner
+                      image: registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:v4.0.2
+                      volumeMounts:
+                        - name: nfs-client-root
+                          mountPath: /persistentvolumes
+                      env:
+                        - name: PROVISIONER_NAME
+                          value: k8s-sigs.io/nfs-subdir-external-provisioner
+                        - name: NFS_SERVER
+                          value: "{{ NFS_SERVER_IP }}"
+                        - name: NFS_PATH
+                          value: "{{ NFS_SHARE_PATH }}"
+                  volumes:
+                    - name: nfs-client-root
+                      nfs:
+                        server: "{{ NFS_SERVER_IP }}"
+                        path: "{{ NFS_SHARE_PATH }}"
+
+          - apiVersion: storage.k8s.io/v1
+            kind: StorageClass
+            metadata:
+              name: nfs-client
+            provisioner: k8s-sigs.io/nfs-subdir-external-provisioner
+            volumeBindingMode: Immediate
+            allowVolumeExpansion: true
+            reclaimPolicy: Delete
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 2. 驗證是否成功建立儲存類別 (StorageClass)
+      shell: kubectl get sc nfs-client
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: sc_result
+      changed_when: false
+
+    - name: 【輸出驗證結果】
+      ansible.builtin.debug:
+        var: sc_result.stdout_lines

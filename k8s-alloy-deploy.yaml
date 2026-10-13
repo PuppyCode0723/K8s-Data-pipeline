@@ -1,0 +1,190 @@
+- name: Deploy Grafana Alloy Collector
+  hosts: masters
+  become: yes
+  run_once: true
+  tasks:
+    - name: 0-1. Clean resource
+      shell: |
+        helm uninstall alloy -n logging || true
+        kubectl delete deployment alloy -n logging || true
+        kubectl delete daemonset alloy -n logging || true
+        kubectl delete serviceaccount alloy -n logging || true
+        kubectl delete clusterrolebinding alloy-view || true
+        kubectl delete configmap alloy -n logging || true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    # ----------------------------------------------------
+    # 1. 建立服務帳戶與 RBAC 權限
+    # ----------------------------------------------------
+    - name: 1-1. 配置 Alloy 所需的服務帳戶
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          - apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: alloy
+              namespace: logging
+          - apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRoleBinding
+            metadata:
+              name: alloy-view
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: view
+            subjects:
+              - kind: ServiceAccount
+                name: alloy
+                namespace: logging
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    # ----------------------------------------------------
+    # 2. 建立 Alloy ConfigMap 內容 
+    # ----------------------------------------------------
+    - name: 2-1. 建立 Alloy 設定檔
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: alloy
+            namespace: logging
+          data:
+            config.alloy: |
+              logging {
+                level  = "info"
+                format = "logfmt"
+              }
+
+              local.file_match "pod_logs" {
+                path_targets = [{
+                  __path__ = "/var/log/pods/*/*/*.log",
+                }]
+              }
+
+              discovery.relabel "parse_pod_logs" {
+                targets = local.file_match.pod_logs.targets
+
+                rule {
+                  source_labels = ["__path__"]
+                  regex         = "^/var/log/pods/([^/_]+)_([^/_]+)_([^/]+)/([^/]+)/.*\\.log$"
+                  target_label  = "namespace"
+                  replacement   = "$1"
+                }
+                
+                rule {
+                  source_labels = ["__path__"]
+                  regex         = "^/var/log/pods/([^/_]+)_([^/_]+)_([^/]+)/([^/]+)/.*\\.log$"
+                  target_label  = "pod"
+                  replacement   = "$2"
+                }
+                
+                rule {
+                  source_labels = ["__path__"]
+                  regex         = "^/var/log/pods/([^/_]+)_([^/_]+)_([^/]+)/([^/]+)/.*\\.log$"
+                  target_label  = "container"
+                  replacement   = "$4"
+                }
+                
+                // 注入固定標籤
+                rule {
+                  target_label = "job"
+                  replacement  = "kubernetes-pods"
+                }
+              }
+
+              // 3. 讀取日誌（.output）
+              loki.source.file "container_logs" {
+                targets    = discovery.relabel.parse_pod_logs.output
+                forward_to = [loki.write.local_loki.receiver]
+              }
+
+              // 4. 出口傳送到 Loki
+              loki.write "local_loki" {
+                endpoint {
+                  url = "http://loki-headless.logging.svc.cluster.local:3100/loki/api/v1/push"
+                }
+              }
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    # ----------------------------------------------------
+    # 3. 部署原生的 DaemonSet
+    # ----------------------------------------------------
+    - name: 3-1. 部署原生 Grafana Alloy DaemonSet
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: alloy
+            namespace: logging
+            labels:
+              app.kubernetes.io/name: alloy
+          spec:
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: alloy
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: alloy
+              spec:
+                serviceAccountName: alloy
+                containers:
+                  - name: alloy
+                    image: grafana/alloy:v1.1.1
+                    args:
+                      - run
+                      - /etc/alloy/config.alloy
+                      - --storage.path=/var/lib/alloy/data
+                    securityContext:
+                      runAsUser: 0
+                      runAsGroup: 0
+                      privileged: true 
+                    volumeMounts:
+                      - name: config
+                        mountPath: /etc/alloy
+                      - name: host-pods-logs
+                        mountPath: /var/log/pods
+                        readOnly: true
+                      - name: host-kubelet-pods
+                        mountPath: /var/lib/kubelet/pods
+                        readOnly: true
+                volumes:
+                  - name: config
+                    configMap:
+                      name: alloy
+                  - name: host-pods-logs
+                    hostPath:
+                      path: /var/log/pods
+                  - name: host-kubelet-pods
+                    hostPath:
+                      path: /var/lib/kubelet/pods
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    # ----------------------------------------------------
+    # 4. 驗證與完工確認
+    # ----------------------------------------------------
+    - name: 4-1. 檢查並確認 DaemonSet 狀態
+      shell: |
+        kubectl get daemonset alloy -n logging
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: alloy_ds_status
+      changed_when: false
+
+    - name: 【Alloy 部署進度】
+      ansible.builtin.debug:
+        msg: 
+          - "=========================================================="
+          - " Grafana Alloy DaemonSet 部署完成！"
+          - " DaemonSet 狀態: {{ alloy_ds_status.stdout }}"
+          - "==========================================================" 

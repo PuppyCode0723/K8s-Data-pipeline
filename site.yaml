@@ -1,0 +1,8 @@
+--- 
+- import_playbook: k8s-infra-deploy.yaml
+- import_playbook: k8s-nfs-deploy.yaml
+- import_playbook: k8s-grafana-deploy.yaml
+- import_playbook: k8s-loki-deploy.yaml
+- import_playbook: k8s-nginx-deploy.yaml
+- import_playbook: k8s-alloy-deploy.yaml
+- import_playbook: k8s-prometheus-deploy.yaml

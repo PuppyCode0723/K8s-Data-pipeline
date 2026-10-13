@@ -1,0 +1,57 @@
+---
+- name: Deploy Prometheus Monitoring
+  hosts: masters
+  become: yes
+  run_once: true
+  tasks:
+    - name: 1-1. 配置 Prometheus 官方 Helm 儲存庫
+      kubernetes.core.helm_repository:
+        name: prometheus-community
+        repo_url: "https://prometheus-community.github.io/helm-charts"
+
+    - name: 2-1. 使用 Helm 原生部署 Prometheus 到 logging 空間
+      kubernetes.core.helm:
+        name: prometheus
+        chart_ref: prometheus-community/prometheus
+        release_namespace: logging
+        state: present
+        values:
+          server:
+            service:
+              type: NodePort
+
+            retention: 5d
+
+            persistentVolume:
+              enabled: true
+              storageClass: "nfs-client"
+              size: 20Gi
+              accessModes:
+                - ReadWriteOnce
+
+          nodeExporter:
+            enabled: true
+
+          kubeStateMetrics:
+            enabled: true
+
+          pushgateway:
+            enabled: false
+          alertmanager:
+            enabled: false
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 3-1. 查詢 Prometheus Server 隨機分配的 NodePort 埠號
+      shell: |
+        kubectl get svc prometheus-server -n logging -o jsonpath='{.spec.ports[0].nodePort}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: prometheus_nodeport
+
+    - name: 【Prometheus 連線資訊】
+      ansible.builtin.debug:
+        msg:
+          - "=========================================================="
+          - " Prometheus 監控系統部署成功！"
+          - "=========================================================="

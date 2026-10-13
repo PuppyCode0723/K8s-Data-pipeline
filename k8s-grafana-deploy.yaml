@@ -1,0 +1,63 @@
+---
+- name: Deploy Grafana Dashboard
+  hosts: masters
+  become: yes
+  run_once: true
+  tasks:
+    - name: 1-1. 建立 logging 專屬命名空間
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: logging
+
+    - name: 1-2. 配置 Grafana 官方 Helm 儲存庫
+      kubernetes.core.helm_repository:
+        name: grafana
+        repo_url: "https://grafana.github.io/helm-charts"
+
+    - name: 2-1. 使用 Helm 原生部署 Grafana 到 logging 空間
+      kubernetes.core.helm:
+        name: grafana
+        chart_ref: grafana/grafana
+        release_namespace: logging
+        state: present
+        values:
+          service:
+            type: NodePort
+          persistence:
+            enabled: true
+            storageClassName: nfs-client
+            size: 10Gi
+            accessModes:
+              - ReadWriteOnce
+
+          grafana.ini:
+            server:
+              root_url: "%(protocol)s://%(domain)s:%(http_port)s/"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: 3-1. 獲取 Grafana 預設自動生成的 admin 管理員密碼
+      shell: |
+        kubectl get secret grafana -n logging -o jsonpath="{.data.admin-password}" | base64 --decode
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: grafana_password_raw
+
+    - name: 3-2. 查詢 Grafana 隨機分配的 NodePort 埠號
+      shell: |
+        kubectl get svc grafana -n logging -o jsonpath='{.spec.ports[0].nodePort}'
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: grafana_nodeport
+
+    - name: 【Grafana 登入資訊】
+      ansible.builtin.debug:
+        msg:
+          - "=========================================================="
+          - " 預設帳號: admin"
+          - " 預設密碼: {{ grafana_password_raw.stdout }}"
+          - "=========================================================="

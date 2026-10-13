@@ -1,0 +1,172 @@
+---
+# ==========================================
+# 階段一：Master 節點清理 
+# ==========================================
+- name: Cleanup Master Node Components
+  hosts: masters
+  become: yes
+  run_once: true
+  tasks:
+    - name: 1-1. 解除安裝 Loki, Alloy 與 Grafana (使用原生 Helm 模組)
+      kubernetes.core.helm:
+        name: "{{ item }}"
+        release_namespace: logging
+        state: absent
+      loop: ['loki', 'alloy', 'grafana']
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: 1-2. 強制拔除 Nginx Gateway 相關資源（防止命名空間卡死）
+      shell: |
+        kubectl delete deployment nginx-gateway -n logging --ignore-not-found --timeout=20s
+        kubectl delete service nginx-gateway -n logging --ignore-not-found --timeout=20s
+        kubectl delete configmap nginx-gateway-config -n logging --ignore-not-found --timeout=20s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: 1-3. 刪除 logging 命名空間
+      shell: kubectl delete namespace logging --timeout=60s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: 1-4. 刪除叢集全域的 Loki 永久儲存卷 (PV)
+      shell: kubectl delete pv loki-local-pv --timeout=30s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: 1-5. 徹底剷除 Master 節點上的實體日誌目錄 (/data/loki)
+      file:
+        path: /data/loki
+        state: absent
+
+    - name: 2-1. 解除安裝 Metrics Server 與 Headlamp (使用原生 Helm 模組)
+      kubernetes.core.helm:
+        name: "{{ item }}"
+        release_namespace: kube-system
+        state: absent
+      loop: ['metrics-server', 'headlamp']
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: 2-2. 清除 Headlamp 的 ServiceAccount 與 ClusterRoleBinding 殘留
+      shell: |
+        kubectl delete clusterrolebinding headlamp-admin --ignore-not-found
+        kubectl delete serviceaccount headlamp-admin -n kube-system --ignore-not-found
+        kubectl delete secret headlamp-admin-secret -n kube-system --ignore-not-found
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: 3-1. 解除安裝 Cilium 與 Hubble
+      shell: /usr/local/bin/cilium uninstall --wait
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: 3-2. 清除本機端的 CLI 工具 (Cilium, Hubble, Helm)
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/bin/cilium
+        - /usr/local/bin/hubble
+        - /usr/local/bin/helm
+
+    - name: 3-3. 移除 root 使用者的 kubectl 權限配置 (.kube)
+      file:
+        path: /root/.kube
+        state: absent
+
+# ==========================================
+# 重置 K8s 與系統組件
+# ==========================================
+- name: Reset and Cleanup All Kubernetes Nodes
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: 1. 執行 kubeadm reset 強制重置節點
+      shell: kubeadm reset -f
+      failed_when: false
+
+    - name: 2. 解除系統套件鎖定 (Un-hold)
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: install
+      loop: ['kubeadm', 'kubelet', 'kubectl']
+      failed_when: false
+
+    - name: 3. 徹底移除 K8s 主程式與 Containerd 套件 (連同設定檔)
+      apt:
+        name: ['kubeadm', 'kubelet', 'kubectl', 'containerd']
+        state: absent
+        purge: yes
+        autoremove: yes
+      failed_when: false
+
+    - name: 4. 清除 apt 來源與金鑰清單
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: 5. 徹底砍斷剩餘的網路介面與 eBPF 掛載點
+      shell: |
+        ip link set dev cilium_net down; ip link delete cilium_net
+        ip link set dev cilium_host down; ip link delete cilium_host
+        ip link set dev cilium_vxlan down; ip link delete cilium_vxlan
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+      failed_when: false
+
+    - name: 5-1. 強制解除 Containerd 與 K8s 殘留的掛載點（防止目錄被鎖定刪不掉）
+      shell: |
+        for mnt in $(mount | grep -E "containerd|kubelet" | awk '{print $3}'); do
+          umount -f $mnt
+        done
+      failed_when: false
+
+    - name: 6. 強制砍掉所有殘留的 K8s/Containerd 目錄
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /var/lib/cni
+        - /etc/cni
+        - /etc/containerd
+        - /var/lib/containerd
+        - /var/run/kubernetes
+        - /etc/sysctl.d/k8s.conf
+        
+    - name: 7. 還原 Linux 核心網路參數 (sysctl)
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        state: absent
+        sysctl_file: /etc/sysctl.conf
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+      failed_when: false
+
+    - name: 7-1. 重新載入系統 sysctl 參數
+      command: sysctl --system
+      failed_when: false
+
+    - name: 8. 還原 /etc/fstab 中的 Swap 自動掛載設定 
+      replace:
+        path: /etc/fstab
+        regexp: '^#\s*([^#].*swap.*)$'
+        replace: '\1'
+
+    - name: 9. 重新啟用系統 Swap 記憶體
+      command: swapon -a
+      failed_when: false
